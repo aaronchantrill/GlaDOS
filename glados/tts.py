@@ -261,6 +261,8 @@ class Synthesizer:
         self, model_path: str, use_cuda: bool, speaker_id: Optional[int] = None
     ):
         self.session = self._initialize_session(model_path, use_cuda)
+        print(self.session)
+        print(f"tts.py use_cuda: {use_cuda}")
         self.id_map = PHONEME_ID_MAP
         try:
             # Load the configuration file
@@ -291,10 +293,11 @@ class Synthesizer:
         self, model_path: str, use_cuda: bool
     ) -> onnxruntime.InferenceSession:
         providers = ["CPUExecutionProvider"]
+        print(f"use_cuda: {use_cuda}")
         if use_cuda:
             providers = [
                 ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
-                "CPUExecutionProvider",
+                # "CPUExecutionProvider",
             ]
 
         return onnxruntime.InferenceSession(
@@ -304,10 +307,15 @@ class Synthesizer:
         )
 
     def generate_speech_audio(self, text: str) -> np.ndarray:
+        text = f", {text}"
         phonemes = self._phonemizer(text)
-        audio = []
+        audio = [] # np.zeros(11026)
+        # audio.append(np.zeros((1, 220500), dtype=np.float32))
         for sentence in phonemes:
             audio_chunk = self._say_phonemes(sentence)
+            # print(type(audio_chunk))
+            # print(audio_chunk.dtype)
+            # print(audio_chunk.shape)
             audio.append(audio_chunk)
         if audio:
             return np.concatenate(audio, axis=1).T

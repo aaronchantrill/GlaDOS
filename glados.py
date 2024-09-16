@@ -1,4 +1,5 @@
 import copy
+import datetime
 import json
 import queue
 import re
@@ -21,20 +22,44 @@ from sounddevice import CallbackFlags
 from glados import asr, tts, vad
 from glados.llama import LlamaServer, LlamaServerConfig
 
+
 logger.remove(0)
 logger.add(sys.stderr, level="INFO")
 
 ASR_MODEL = "ggml-medium-32-2.en.bin"
 VAD_MODEL = "silero_vad.onnx"
 LLM_STOP_SEQUENCE = "<|eot_id|>"  # End of sentence token for Meta-Llama-3
-LLAMA3_TEMPLATE = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+TEMPLATES = {
+    "LLAMA3": "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}",
+    "CHATML": "".join([
+        "{% if messages[0]['role'] == 'system' %}",
+        "    {% set offset = 1 %}",
+        "{% else %}",
+        "    {% set offset = 0 %}",
+        "{% endif %}",
+        "",
+        "{{ bos_token }}",
+        "{% for message in messages %}",
+        "    {% if (message['role'] == 'user') != (loop.index0 % 2 == offset) %}",
+        "        {{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}",
+        "    {% endif %}",
+        "",
+        "    {{ '<|im_start|>' + message['role'] + '\n' + message['content'] | trim + '<|im_end|>\n' }}",
+        "{% endfor %}",
+        "",
+        "{% if add_generation_prompt %}",
+        "    {{ '<|im_start|>assistant\n' }}",
+        "{% endif %}"
+    ])
+}
+
 PAUSE_TIME = 0.05  # Time to wait between processing loops
 SAMPLE_RATE = 16000  # Sample rate for input stream
 VAD_SIZE = 50  # Milliseconds of sample for Voice Activity Detection (VAD)
 VAD_THRESHOLD = 0.9  # Threshold for VAD detection
 BUFFER_SIZE = 600  # Milliseconds of buffer before VAD detection
 PAUSE_LIMIT = 400  # Milliseconds of pause allowed before processing
-SIMILARITY_THRESHOLD = 2  # Threshold for wake word similarity
+SIMILARITY_THRESHOLD = 3  # Threshold for wake word similarity
 
 NEUROTOXIN_RELEASE_ALLOWED = False  # preparation for function calling, see issue #13
 DEFAULT_PERSONALITY_PREPROMPT = (
@@ -53,6 +78,7 @@ class GladosConfig:
     announcement: Optional[str]
     personality_preprompt: List[dict[str, str]]
     interruptible: bool
+    template: str = "LLAMA3"
     voice_model: str = "glados.onnx"
     speaker_id: int = None
 
@@ -79,6 +105,7 @@ class Glados:
         completion_url: str,
         api_key: str | None = None,
         wake_word: str | None = None,
+        template: str = "LLAMA3",
         personality_preprompt: Sequence[dict[str, str]] = DEFAULT_PERSONALITY_PREPROMPT,
         announcement: str | None = None,
         interruptible: bool = True,
@@ -108,7 +135,7 @@ class Glados:
         self._asr_model = asr.ASR(model=str(Path.cwd() / "models" / ASR_MODEL))
         self._tts = tts.Synthesizer(
             model_path=str(Path.cwd() / "models" / voice_model),
-            use_cuda=False,
+            use_cuda=True,
             speaker_id=speaker_id,
         )
 
@@ -133,7 +160,8 @@ class Glados:
 
         self.shutdown_event = threading.Event()
 
-        self.template = Template(LLAMA3_TEMPLATE)
+        print(f"Using template {template}")
+        self.template = Template(TEMPLATES[template])
 
         llm_thread = threading.Thread(target=self.process_LLM)
         llm_thread.start()
@@ -183,6 +211,7 @@ class Glados:
             completion_url=config.completion_url,
             api_key=config.api_key,
             wake_word=config.wake_word,
+            template=config.template,
             personality_preprompt=personality_preprompt,
             announcement=config.announcement,
             interruptible=config.interruptible,
@@ -201,7 +230,7 @@ class Glados:
         logger.success("Listening...")
         # Loop forever, but is 'paused' when new samples are not available
         try:
-            while True:
+            while not self.shutdown_event.is_set():
                 sample, vad_confidence = self._sample_queue.get()
                 self._handle_audio_sample(sample, vad_confidence)
         except KeyboardInterrupt:
@@ -277,9 +306,20 @@ class Glados:
         assert self.wake_word is not None, "Wake word should not be None"
 
         words = text.split()
-        closest_distance = min(
-            [distance(word.lower(), self.wake_word) for word in words]
-        )
+        distances = []
+        for word in words:
+            word = word.lower()
+            if self.wake_word.lower() == 'glados':
+                # remove trailing comma
+                if word[-1] in (',', '.', '?'):
+                    word = word[:-1]
+                if word in ("laudos", "clottos", "blattos", "glottos", "glaudio", "blotows", "laraos", "lettos"):
+                    word = 'glados'
+            distances.append(distance(word, self.wake_word))
+        closest_distance = min(distances)
+        #for word in words:
+        #    print(f"Comparing {word.lower()} to {self.wake_word}: {distance(word.lower(), self.wake_word)}")
+        #print(f"Checking if {closest_distance} < {SIMILARITY_THRESHOLD}")
         return closest_distance < SIMILARITY_THRESHOLD
 
     def _process_detected_audio(self):
@@ -300,7 +340,7 @@ class Glados:
             logger.success(f"ASR text: '{detected_text}'")
 
             if self.wake_word and not self._wakeword_detected(detected_text):
-                logger.info(f"Required wake word {self.wake_word=} not detected.")
+                logger.info(f"Required wake word {self.wake_word=} not detected in '{detected_text}'.")
             else:
                 self.llm_queue.put(detected_text)
                 self.processing = True
@@ -460,58 +500,60 @@ class Glados:
         while not self.shutdown_event.is_set():
             try:
                 detected_text = self.llm_queue.get(timeout=0.1)
+                print(f"detected_text: {detected_text}")
+                if "shut down" in detected_text.lower() or "shutdown" in detected_text.lower():
+                    self.tts_queue.put("I'm shutting down. You monster.")
+                    self.shutdown_event.set()
+                    self.input_stream.stop()
+                else:
+                    self.messages.append({"role": "user", "content": detected_text})
+                    now = datetime.datetime.now()
+                    prompt = self.template.render(
+                        messages=[{"role": message['role'], "content": message['content'].format(t=now)} for message in self._messages],
+                        bos_token="<|begin_of_text|>",
+                        add_generation_prompt=True,
+                    )
+                    logger.debug(f"{prompt=}")
 
-                self.messages.append({"role": "user", "content": detected_text})
+                    data = {
+                        "stream": True,
+                        "prompt": prompt,
+                    }
+                    logger.debug(f"starting request on {self.messages=}")
+                    logger.debug("Performing request to LLM server...")
 
-                prompt = self.template.render(
-                    messages=self.messages,
-                    bos_token="<|begin_of_text|>",
-                    add_generation_prompt=True,
-                )
+                    # Perform the request and process the stream
 
-                logger.debug(f"{prompt=}")
-
-                data = {
-                    "stream": True,
-                    "prompt": prompt,
-                }
-                logger.debug(f"starting request on {self.messages=}")
-                logger.debug("Performing request to LLM server...")
-
-                # Perform the request and process the stream
-
-                with requests.post(
-                    self.completion_url,
-                    headers=self.prompt_headers,
-                    json=data,
-                    stream=True,
-                ) as response:
-                    sentence = []
-                    for line in response.iter_lines():
-                        if self.processing is False:
-                            break  # If the stop flag is set from new voice input, halt processing
-                        if line:  # Filter out empty keep-alive new lines
-                            line = self._clean_raw_bytes(line)
-                            next_token = self._process_line(line)
-                            if next_token:
-                                sentence.append(next_token)
-                                # If there is a pause token, send the sentence to the TTS queue
-                                if next_token in [
-                                    ".",
-                                    "!",
-                                    "?",
-                                    ":",
-                                    ";",
-                                    "?!",
-                                    "\n",
-                                    "\n\n",
-                                ]:
-                                    self._process_sentence(sentence)
-                                    sentence = []
-                    if self.processing:
-                        if sentence:
-                            self._process_sentence(sentence)
-                    self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
+                    with requests.post(
+                        self.completion_url,
+                        headers=self.prompt_headers,
+                        json=data,
+                        stream=True,
+                    ) as response:
+                        sentence = []
+                        for line in response.iter_lines():
+                            if self.processing is False:
+                                break  # If the stop flag is set from new voice input, halt processing
+                            if line:  # Filter out empty keep-alive new lines
+                                line = self._clean_raw_bytes(line)
+                                next_token = self._process_line(line)
+                                if next_token:
+                                    sentence.append(next_token)
+                                    # If there is a pause token, send the sentence to the TTS queue
+                                    if next_token in [
+                                        ".",
+                                        "!",
+                                        "?",
+                                        "?!",
+                                        "\n",
+                                        "\n\n",
+                                    ]:
+                                        self._process_sentence(sentence)
+                                        sentence = []
+                        if self.processing:
+                            if sentence:
+                                self._process_sentence(sentence)
+                        self.tts_queue.put("<EOS>")  # Add end of stream token to the queue
             except queue.Empty:
                 time.sleep(PAUSE_TIME)
 
@@ -525,12 +567,11 @@ class Glados:
         to the TTS queue.
         """
         sentence = "".join(current_sentence)
-        sentence = re.sub(r"\*.*?\*|\(.*?\)", "", sentence)
+        sentence = re.sub(r"\*.*?\*|\(.*?\)|\<\|.*?\|\>", "", sentence)
         sentence = (
             sentence.replace("\n\n", ". ")
             .replace("\n", ". ")
             .replace("  ", " ")
-            .replace(":", " ")
         )
         if sentence:
             self.tts_queue.put(sentence)
@@ -542,7 +583,6 @@ class Glados:
         Args:
             line (dict): The line of text from the LLM server.
         """
-
         if not line["stop"]:
             token = line["content"]
             return token
